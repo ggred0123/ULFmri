@@ -14,10 +14,16 @@ Channels are [T1w, T2w, FLAIR]; reference = T2w.
   - require T1w AND T2w (else the subject is skipped / excluded)
   - FLAIR optional -> missing slot copy-filled from T2w, target_avail marks it 0
 
-Output (same layout as preprocess_3t.py so the dataloader is unchanged):
-  <out_root>/<dataset>/<subject>/slice_<zzz>.npy   # float32 [3, res, res] in [0,1]
+Slices are cut in all three orientations (--orientations, default axial+coronal
++sagittal). The 3T volumes are 3D, so coronal/sagittal are reslices of the same
+registered volume, not separate acquisitions -- the prior gets 3x the slices and
+learns all three viewing planes. The orientation is written to metadata so the
+trainer can hand it to the text encoder as the prompt.
+
+Output:
+  <out_root>/<dataset>/<subject>/<orientation>_<kkk>.npy  # float32 [3, res, res] in [0,1]
   <out_root>/metadata.jsonl
-  <out_root>/registration_qc.jsonl                 # per-subject metric / status
+  <out_root>/registration_qc.jsonl                        # per-subject metric / status
 """
 import re
 import json
@@ -33,6 +39,7 @@ import torch.nn.functional as F
 
 MODALITIES = ["T1w", "T2w", "FLAIR"]
 HF_RE = re.compile(r"^(sub-[^_]+)_ses-c01_acq[-_]HF_(T1w|T2w|FLAIR)\.nii(?:\.gz)?$")
+ORIENTATIONS = ["axial", "coronal", "sagittal"]
 
 
 # ---------------------------------------------------------------- discovery
@@ -127,12 +134,50 @@ def resize2d(slc, res, mode="bicubic"):
     return t[0, 0].clamp(0.0, 1.0).numpy().astype(np.float32)
 
 
+def pad_center(a, H, W):
+    out = np.zeros((H, W), dtype=np.float32)
+    top, left = (H - a.shape[0]) // 2, (W - a.shape[1]) // 2
+    out[top:top + a.shape[0], left:left + a.shape[1]] = a
+    return out
+
+
+def to_canvas(slc, res):
+    """Center the slice on a res x res canvas WITHOUT changing its aspect ratio.
+
+    Every 3T volume here is 1mm isotropic and <= 256 voxels along every axis, so at
+    res=256 this is pure zero-padding: no interpolation at all, 1 pixel stays 1 mm,
+    and a head is the same physical size in axial, coronal and sagittal. The old
+    behaviour (stretch each slice to res x res) squashed coronal/sagittal by up to
+    1.4x on ulfenc/webb -- an orientation-dependent geometric distortion the prior
+    would have had to absorb. Slices bigger than the canvas are square-padded first
+    and only then resampled, so the aspect ratio survives that path too.
+    """
+    H, W = slc.shape
+    if max(H, W) > res:
+        S = max(H, W)
+        return resize2d(pad_center(slc, S, S), res)
+    return pad_center(slc, res, res)
+
+
+def take_slice(stack, orientation, k):
+    """One slice out of a canonical-RAS [3, X, Y, Z] stack (X: L->R, Y: P->A, Z: I->S).
+
+    Axial keeps the existing [X, Y] convention. Coronal/sagittal are transposed and
+    flipped so that superior points up in the saved image -- without that they come
+    out lying on their side, and every orientation would need its own upright prior.
+    """
+    if orientation == "axial":
+        return np.ascontiguousarray(stack[:, :, :, k])          # [3, X, Y]
+    s = stack[:, :, k, :] if orientation == "coronal" else stack[:, k, :, :]
+    return np.ascontiguousarray(s.transpose(0, 2, 1)[:, ::-1, :])   # [3, Z(S up), X or Y]
+
+
 # ---------------------------------------------------------------- per subject
 def _affine_key(path):
     return np.round(nib.load(str(path)).affine, 1).tobytes()
 
 
-def process_subject(ds, sub, mods, out_root, res, min_fg, qc_f, meta_f):
+def process_subject(ds, sub, mods, out_root, res, min_fg, qc_f, meta_f, orientations):
     if "T2w" not in mods or "T1w" not in mods:
         return 0, "skip_missing_T1_or_T2"
 
@@ -173,25 +218,33 @@ def process_subject(ds, sub, mods, out_root, res, min_fg, qc_f, meta_f):
             return 0, f"shape_mismatch_{m}"
 
     stack = np.stack([chans[m] for m in MODALITIES], 0)  # [3, X, Y, Z] RAS
-    Z = stack.shape[3]
+    # axis of `stack` that each orientation steps along (0 is the modality axis)
+    n_along = {"sagittal": stack.shape[1], "coronal": stack.shape[2], "axial": stack.shape[3]}
     sub_out = out_root / ds / sub
     sub_out.mkdir(parents=True, exist_ok=True)
     kept = 0
-    for z in range(Z):
-        slc = stack[:, :, :, z]
-        if (slc[:2] > 0.02).mean() < min_fg:
-            continue
-        ch = np.stack([resize2d(slc[c], res) for c in range(3)], 0)
-        fp = sub_out / f"slice_{z:03d}.npy"
-        np.save(fp, ch.astype(np.float32))
-        meta_f.write(json.dumps({
-            "path": str(fp.relative_to(out_root)), "dataset": ds,
-            "subject": sub, "slice": z, "target_avail": avail,
-        }) + "\n")
-        kept += 1
+    per_ori = {}
+    for ori in orientations:
+        kept_ori = 0
+        for k in range(n_along[ori]):
+            slc = take_slice(stack, ori, k)
+            # foreground fraction on the raw slice (before padding), so the threshold
+            # means the same thing whatever the in-plane matrix is
+            if (slc[:2] > 0.02).mean() < min_fg:
+                continue
+            ch = np.stack([to_canvas(slc[c], res) for c in range(3)], 0)
+            fp = sub_out / f"{ori}_{k:03d}.npy"
+            np.save(fp, ch.astype(np.float32))
+            meta_f.write(json.dumps({
+                "path": str(fp.relative_to(out_root)), "dataset": ds,
+                "subject": sub, "slice": k, "orientation": ori, "target_avail": avail,
+            }) + "\n")
+            kept_ori += 1
+        per_ori[ori] = kept_ori
+        kept += kept_ori
     qc_f.write(json.dumps({
-        "dataset": ds, "subject": sub, "avail": avail,
-        "reg_metric": metrics, "slices": kept,
+        "dataset": ds, "subject": sub, "avail": avail, "shape": list(stack.shape[1:]),
+        "reg_metric": metrics, "slices": kept, "slices_per_orientation": per_ori,
     }) + "\n")
     return kept, "ok"
 
@@ -201,6 +254,8 @@ def main():
     ap.add_argument("--medical_root", default="/home/rintern14/ymk/medical")
     ap.add_argument("--out_root", default="/home/rintern14/ymk/data_stage0_3t_reg")
     ap.add_argument("--datasets", nargs="+", default=["kcl", "ulfenc", "webb"])
+    ap.add_argument("--orientations", nargs="+", default=ORIENTATIONS, choices=ORIENTATIONS,
+                    help="reslice planes to cut from each 3T volume")
     ap.add_argument("--res", type=int, default=256)
     ap.add_argument("--min_fg", type=float, default=0.05)
     ap.add_argument("--limit", type=int, default=0, help="process at most N subjects (0=all) for a smoke test")
@@ -216,7 +271,8 @@ def main():
     done = 0
     for ds, subjects in found.items():
         for sub, mods in sorted(subjects.items()):
-            kept, status = process_subject(ds, sub, mods, out_root, args.res, args.min_fg, qc_f, meta_f)
+            kept, status = process_subject(ds, sub, mods, out_root, args.res, args.min_fg,
+                                           qc_f, meta_f, args.orientations)
             totals[status] += 1
             totals["slices"] += kept
             print(f"[{ds}] {sub}: {status} kept={kept} "

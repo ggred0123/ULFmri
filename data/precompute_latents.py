@@ -31,12 +31,20 @@ import torch
 from diffusers import AutoencoderKL
 
 
+def load_vae(path):
+    """Accept a VAE folder (config.json at its root) or an SD3 repo/id with the VAE
+    under vae/. Official SD3's VAE and the local dual_diff copy agree to ~0.4%
+    (bf16 rounding), so either source produces compatible latents."""
+    sub = None if (Path(path) / "config.json").exists() else "vae"
+    return AutoencoderKL.from_pretrained(path, subfolder=sub)
+
+
 @torch.no_grad()
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data_root", default="/home/rintern14/ymk/data_stage0_3t_reg")
     ap.add_argument("--out_root", default="/home/rintern14/ymk/data_stage0_3t_latents")
-    ap.add_argument("--vae_path", default="/home/rintern14/ymk/pretrained_models/dual_diff_sd3_512_base/vae")
+    ap.add_argument("--vae_path", default="stabilityai/stable-diffusion-3-medium-diffusers")
     ap.add_argument("--batch_size", type=int, default=16, help="slices per batch (x3 modalities on the GPU)")
     ap.add_argument("--packed", action="store_true",
                     help="legacy: encode the 3 modalities as one RGB image (16ch). Much worse fidelity.")
@@ -47,7 +55,7 @@ def main():
     data_root, out_root = Path(args.data_root), Path(args.out_root)
     out_root.mkdir(parents=True, exist_ok=True)
 
-    vae = AutoencoderKL.from_pretrained(args.vae_path).to(device, dtype).eval()
+    vae = load_vae(args.vae_path).to(device, dtype).eval()
     scaling = vae.config.scaling_factor
     mode = "packed RGB (16ch)" if args.packed else "per-modality (48ch)"
     print(f"VAE latent_ch={vae.config.latent_channels} scaling={scaling} | mode={mode}")
@@ -78,10 +86,11 @@ def main():
             fp = out_root / rel
             fp.parent.mkdir(parents=True, exist_ok=True)
             np.save(fp, l_)
-            meta_out.write(json.dumps({
-                "path": rel, "dataset": it["dataset"], "subject": it["subject"],
-                "slice": it["slice"], "target_avail": it["target_avail"],
-            }) + "\n")
+            row = {"path": rel, "dataset": it["dataset"], "subject": it["subject"],
+                   "slice": it["slice"], "target_avail": it["target_avail"]}
+            if "orientation" in it:      # Stage 0 text conditioning keys off this
+                row["orientation"] = it["orientation"]
+            meta_out.write(json.dumps(row) + "\n")
         buf_x.clear(); buf_it.clear()
 
     for i, it in enumerate(items):

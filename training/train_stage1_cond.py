@@ -90,6 +90,7 @@ class PairLatentDataset(Dataset):
             "target": torch.from_numpy(z["target"].astype("float32")),   # [48,h,w]
             "input_avail": torch.tensor(it["input_avail"], dtype=torch.float32),
             "target_avail": torch.tensor(it["target_avail"], dtype=torch.float32),
+            "dataset": it["dataset"],        # picks this sample's text prompt (default collate keeps it a list of str)
         }
 
 
@@ -247,6 +248,29 @@ class AvailEmbedder(nn.Module):
         return self.net(avail)
 
 
+def ssim(a, b, data_range=1.0, win=11, sigma=1.5):
+    """Wang et al. SSIM on [N,H,W] images in [0,1]; returns a per-image score [N].
+
+    Gaussian window, the standard 11x11 / sigma=1.5 / K1=0.01 / K2=0.03 setup, implemented
+    here to avoid a new dependency. Convolution is 'valid' (no padding), which drops the
+    border the window cannot cover -- the same crop skimage applies, so the numbers match
+    structural_similarity(..., gaussian_weights=True, sigma=1.5, use_sample_covariance=False)
+    to ~1e-6. Zero-padding instead would bias the edge statistics.
+    """
+    c = torch.arange(win, dtype=torch.float32, device=a.device) - (win - 1) / 2
+    g = torch.exp(-(c ** 2) / (2 * sigma ** 2))
+    g = g / g.sum()
+    k = (g[:, None] * g[None, :])[None, None]
+    a, b = a[:, None].float(), b[:, None].float()
+    mu_a, mu_b = F.conv2d(a, k), F.conv2d(b, k)
+    va = F.conv2d(a * a, k) - mu_a ** 2
+    vb = F.conv2d(b * b, k) - mu_b ** 2
+    vab = F.conv2d(a * b, k) - mu_a * mu_b
+    c1, c2 = (0.01 * data_range) ** 2, (0.03 * data_range) ** 2
+    s = ((2 * mu_a * mu_b + c1) * (2 * vab + c2)) / ((mu_a ** 2 + mu_b ** 2 + c1) * (va + vb + c2))
+    return s.flatten(1).mean(1)
+
+
 # ------------------------------------------------------------------------------ train
 def parse_args():
     p = argparse.ArgumentParser()
@@ -285,14 +309,25 @@ def parse_args():
                    help="floor on sigma when computing sigma^-2 weighting (numerical safety)")
     # periodic sampling
     p.add_argument("--validation_steps", type=int, default=1000, help="sample every N steps (0=off)")
+    p.add_argument("--val_subjects_per_ds", type=int, default=0,
+                   help="hold out N SUBJECTS per dataset (subject-level, so adjacent slices cannot "
+                        "leak) and report loss/PSNR on them instead of training on them. 0 = use all. "
+                        "1 costs ~3.6%% of the data and covers all three domains.")
+    p.add_argument("--eval_psnr_steps", type=int, default=0,
+                   help="every N steps, CFG-sample the held-out slices and log PSNR/SSIM against the "
+                        "real 3T (0=off). Far easier to read than the flow loss; costs a sampling pass.")
+    p.add_argument("--eval_image_slices", type=int, default=16,
+                   help="how many held-out slices the PSNR/SSIM eval samples (a full sampling pass "
+                        "per slice, so this trades eval time for a less noisy number)")
     p.add_argument("--num_validation_samples", type=int, default=4)
     p.add_argument("--num_inference_steps", type=int, default=50)
     p.add_argument("--inference_shift", type=float, default=None,
                    help="override the scheduler's sigma shift at sampling time. SD3 ships "
                         "shift=3.0, which spends only ~4 of 50 steps below sigma=0.25 -- the "
                         "band that actually sharpens detail. 1.0 gives ~12 of 50 there.")
-    p.add_argument("--vae_path", default="/home/rintern14/ymk/pretrained_models/dual_diff_sd3_512_base/vae",
-                   help="VAE used to decode validation samples (must match the one that encoded the latents)")
+    p.add_argument("--vae_path", default="stabilityai/stable-diffusion-3-medium-diffusers",
+                   help="VAE used to decode validation samples (must match the one that encoded the latents). "
+                        "Either a VAE folder or an SD3 repo/id whose VAE lives under vae/.")
     p.add_argument("--mixed_precision", default="bf16", choices=["no", "fp16", "bf16"])
     p.add_argument("--gradient_checkpointing", action="store_true")
     p.add_argument("--use_8bit_adam", action="store_true",
@@ -303,6 +338,11 @@ def parse_args():
     p.add_argument("--n_modalities", type=int, default=3,
                    help="latents are n_modalities x 16ch, ordered [T1|T2|FLAIR]. "
                         "1 = legacy packed-RGB 16ch latents.")
+    p.add_argument("--dataset_weights", default=None,
+                   help="per-source loss weights, e.g. 'kcl=2.5,ulfenc=1,webb=1'. The sources fit "
+                        "at very different rates (kcl still improves at 6k steps while ulfenc/webb "
+                        "peak at 1k), so one schedule has no single best stopping point; weighting "
+                        "pulls their optima together. Unlisted sources default to 1.0.")
     p.add_argument("--mask_loss_by_avail", action="store_true",
                    help="drop missing target modalities from the loss (training_plan.md 9). "
                         "Requires per-modality latents (--n_modalities 3).")
@@ -316,7 +356,19 @@ def parse_args():
                         "model learns to synthesize it -- matches kcl's no-input-FLAIR case.")
     p.add_argument("--cond_dropout_prob", type=float, default=0.1,
                    help="prob of dropping the WHOLE condition (§6), enabling classifier-free guidance.")
-    p.add_argument("--guidance_scale", type=float, default=2.0, help="CFG scale for validation sampling.")
+    p.add_argument("--guidance_scale", type=float, default=2.0,
+                   help="IMAGE CFG scale: how hard sampling is pushed toward the 64mT condition.")
+    p.add_argument("--text_embeds_path", default=None,
+                   help="dict of per-source prompt embeddings from data/precompute_text_embeds.py. "
+                        "Without it every sample shares one fixed embedding, the text path carries "
+                        "no information, and text CFG is undefined (it cancels between branches).")
+    p.add_argument("--text_dropout_prob", type=float, default=0.1,
+                   help="probability of swapping a sample's prompt for the null ('') one, so the "
+                        "model also learns v(x | no text) -- required for text guidance to mean "
+                        "anything at inference. Independent of --cond_dropout_prob (image axis).")
+    p.add_argument("--text_guidance_scale", type=float, default=0.0,
+                   help="TEXT CFG scale, on top of the image one (InstructPix2Pix-style two-axis "
+                        "guidance). 0 = off and sampling stays at 2 forward passes; >0 costs a 3rd.")
     p.add_argument("--val_input_root", default=None,
                    help="input-only latents (unpaired ULF) for a generalization montage; "
                         "made by preprocess_val_inputs.py + precompute_latents.py")
@@ -400,6 +452,31 @@ def main():
         gc.collect()
         torch.cuda.empty_cache()
 
+    # Per-source prompts (optional). Stacked into a bank so a batch is one index_select
+    # instead of a dict lookup per sample. Row `null_row` is the "" prompt, which is both
+    # the text-dropout target during training and the text-unconditional branch at sampling.
+    text_bank = text_pooled_bank = text_row = None
+    null_row = 0
+    if args.text_embeds_path:
+        tb = torch.load(args.text_embeds_path, map_location="cpu")
+        names = sorted(tb)
+        text_row = {n: i for i, n in enumerate(names)}
+        null_row = text_row["null"]
+        text_bank = torch.stack([tb[n]["prompt_embeds"][0] for n in names]).to(acc.device, weight_dtype)
+        text_pooled_bank = torch.stack([tb[n]["pooled_prompt_embeds"][0] for n in names]).to(acc.device, weight_dtype)
+        if acc.is_main_process:
+            print(f"text prompts: {names} (null row {null_row}), "
+                  f"dropout {args.text_dropout_prob}, guidance {args.text_guidance_scale}", flush=True)
+
+    def text_for(names_or_rows, bsz):
+        """(prompt_embeds, pooled) for a batch; falls back to the single fixed embedding."""
+        if text_bank is None:
+            return null_prompt_embeds.repeat(bsz, 1, 1), null_pooled.repeat(bsz, 1)
+        rows = names_or_rows
+        if not torch.is_tensor(rows):
+            rows = torch.tensor([text_row.get(d, null_row) for d in rows], device=acc.device)
+        return text_bank[rows], text_pooled_bank[rows]
+
     # Stage 1 conditioning embedders (both zero-init): input_avail tells the model
     # which condition modalities are real; target_avail also masks the loss (§9).
     input_avail_embedder = AvailEmbedder(null_pooled.shape[-1])
@@ -445,7 +522,22 @@ def main():
     else:
         optimizer = torch.optim.AdamW(groups, betas=(0.9, 0.999), weight_decay=1e-2, eps=1e-8)
 
+    ds_weights = {}
+    if args.dataset_weights:
+        ds_weights = {k: float(v) for k, v in
+                      (kv.split("=") for kv in args.dataset_weights.split(","))}
+
     dataset = PairLatentDataset(args.latent_root, datasets=args.datasets)
+    heldout = None
+    if args.val_subjects_per_ds:
+        val_keys = split_val_subjects(dataset.items, args.val_subjects_per_ds)
+        heldout = PairLatentDataset(args.latent_root, datasets=args.datasets,
+                                    split="val", val_keys=val_keys)
+        dataset = PairLatentDataset(args.latent_root, datasets=args.datasets,
+                                    split="train", val_keys=val_keys)
+        if acc.is_main_process:
+            print(f"hold-out {len(val_keys)} subject(s) / {len(heldout)} slices "
+                  f"({len(heldout) / (len(heldout) + len(dataset)):.1%}): {sorted(val_keys)}", flush=True)
     loader = DataLoader(dataset, batch_size=args.train_batch_size, shuffle=True,
                         num_workers=args.dataloader_num_workers, drop_last=True, pin_memory=True)
 
@@ -495,16 +587,39 @@ def main():
     # ---- periodic sampling: decode a few unconditional samples to eyeball progress ----
     val_vae = None
     if args.validation_steps and acc.is_main_process:
-        val_vae = AutoencoderKL.from_pretrained(args.vae_path).to(acc.device, weight_dtype).eval()
+        vae_sub = None if os.path.exists(os.path.join(args.vae_path, "config.json")) else "vae"
+        val_vae = AutoencoderKL.from_pretrained(args.vae_path, subfolder=vae_sub).to(acc.device, weight_dtype).eval()
         val_vae.requires_grad_(False)
     target_ch = args.n_modalities * 16        # we predict the 3T target (48ch)
     latent_hw = args.resolution // 8          # SD3 VAE downsamples 8x
     # fixed validation samples (real ULF input + its ground-truth 3T target)
     n_val = args.num_validation_samples
-    _vi = [dataset[i] for i in range(min(n_val, len(dataset)))]
+
+    def central_picks(items, n):
+        """Indices of central slices, one per subject (cycling if n > #subjects).
+
+        Taking the first n items -- or a global stride -- lands on the empty top/bottom
+        slices of a volume: every subject contributes the same number of slices, so a
+        stride aliases against that period and picks exactly the ends. Those decode to
+        noise, which makes the montage look broken while the data is fine.
+        """
+        per_sub = {}
+        for i, it in enumerate(items):
+            per_sub.setdefault(it["subject"], []).append(i)
+        subs = sorted(per_sub)
+        out = []
+        for k in range(n):
+            idx = per_sub[subs[k % len(subs)]]
+            out.append(idx[min(len(idx) - 1, len(idx) // 2 + 8 * (k // len(subs)))])
+        return out
+
+    _src = heldout if heldout is not None else dataset      # prefer unseen subjects
+    _vi = [_src[i] for i in central_picks(_src.items, min(n_val, len(_src)))]
     val_inputs = torch.stack([d["input"] for d in _vi])
     val_targets = torch.stack([d["target"] for d in _vi])
     val_iavail = torch.stack([d["input_avail"] for d in _vi])
+    val_tavail = torch.stack([d["target_avail"] for d in _vi])
+    val_src = [d["dataset"] for d in _vi]
 
     def decode48(lat_scaled):
         """[n,48,h,w] scaled latent -> [n,3,H,W] numpy image in [0,1] (per-modality)."""
@@ -520,13 +635,28 @@ def main():
     if args.val_input_root:
         root = Path(args.val_input_root)
         uitems = [json.loads(l) for l in open(root / "metadata_latents.jsonl")]
-        stride = max(1, len(uitems) // max(1, n_val))
-        pick = uitems[::stride][:n_val]
+        pick = [uitems[i] for i in central_picks(uitems, min(n_val, len(uitems)))]
         val_uinputs = torch.stack([torch.from_numpy(np.load(root / it["path"]).astype("float32")) for it in pick])
         val_uiavail = torch.stack([torch.tensor(it["target_avail"], dtype=torch.float32) for it in pick])
 
-    def sample_cond(cond, iav):
-        """CFG-sample 3T from a condition. cond/iav on device. Returns [n,3,H,W] numpy."""
+    def sample_cond(cond, iav, tav=None, src=None):
+        """CFG-sample 3T from a condition. cond/iav on device. Returns [n,3,H,W] numpy.
+
+        Two guidance axes, InstructPix2Pix style:
+            v = v_uncond + s_img*(v_img - v_uncond) + s_txt*(v_full - v_img)
+        where v_uncond has neither condition, v_img has the 64mT image with the null
+        prompt, and v_full adds this sample's source prompt. With s_txt = 0 (or no
+        --text_embeds_path) the third term vanishes and this is the plain 2-pass image
+        CFG -- the text tokens are then identical in both branches and cancel, which is
+        why text guidance is a no-op unless the model was trained with text dropout.
+
+        tav: which TARGET modalities are being asked for; defaults to all three. With
+        --use_avail the training loop always adds avail_embedder(target_avail) to the
+        pooled projection, so leaving it out here would sample from a pooled vector the
+        model never saw (measured: 5.8dB worse). It is not what CFG steers, so the same
+        value goes into every branch and cancels in the differences.
+        src: per-sample source names for the text branch; None -> null prompt.
+        """
         net = acc.unwrap_model(transformer)
         iae = acc.unwrap_model(input_avail_embedder)
         n = cond.shape[0]
@@ -535,21 +665,36 @@ def main():
         sched.set_timesteps(args.num_inference_steps, device=acc.device)
         lat = torch.randn((n, target_ch, latent_hw, latent_hw), device=acc.device, dtype=weight_dtype)
         zeros = torch.zeros_like(cond)
-        pe = null_prompt_embeds.repeat(n, 1, 1)
-        base = null_pooled.repeat(n, 1)
-        pooled_c = base + iae(iav)
-        pooled_u = base + iae(torch.zeros_like(iav))
-        gs = args.guidance_scale
+        pe_null, pooled_null = text_for(None if text_bank is None
+                                        else torch.full((n,), null_row, device=acc.device), n)
+        use_text = text_bank is not None and args.text_guidance_scale != 0.0 and src is not None
+        pe_src, pooled_src = text_for(src, n) if use_text else (pe_null, pooled_null)
+
+        avail_c = iae(iav)
+        avail_u = iae(torch.zeros_like(iav))
+        t_emb = 0.0
+        if avail_embedder is not None:
+            want = torch.ones_like(iav) if tav is None else tav
+            t_emb = acc.unwrap_model(avail_embedder)(want)
+        p_uncond = pooled_null + avail_u + t_emb
+        p_img = pooled_null + avail_c + t_emb
+        p_full = pooled_src + avail_c + t_emb
+
+        s_img, s_txt = args.guidance_scale, (args.text_guidance_scale if use_text else 0.0)
         for t in sched.timesteps:
             tt = t.expand(n).to(acc.device)
-            v_c = net(hidden_states=torch.cat([lat, cond], 1), timestep=tt,
-                      encoder_hidden_states=pe, pooled_projections=pooled_c, return_dict=False)[0]
-            if gs != 1.0:
-                v_u = net(hidden_states=torch.cat([lat, zeros], 1), timestep=tt,
-                          encoder_hidden_states=pe, pooled_projections=pooled_u, return_dict=False)[0]
-                v = v_u + gs * (v_c - v_u)
-            else:
-                v = v_c
+
+            def run(x, emb, pooled):
+                return net(hidden_states=x, timestep=tt, encoder_hidden_states=emb,
+                           pooled_projections=pooled, return_dict=False)[0]
+
+            with_img = torch.cat([lat, cond], 1)
+            v = v_img = run(with_img, pe_null, p_img)
+            if s_img != 1.0:
+                v_uncond = run(torch.cat([lat, zeros], 1), pe_null, p_uncond)
+                v = v_uncond + s_img * (v_img - v_uncond)
+            if s_txt != 0.0:
+                v = v + s_txt * (run(with_img, pe_src, p_full) - v_img)
             lat = sched.step(v, t, lat, return_dict=False)[0]
         return decode48(lat)
 
@@ -572,24 +717,103 @@ def main():
         net = acc.unwrap_model(transformer)
         was_training = net.training
         net.eval()
-        # Primary validation: unpaired ULF-only webb (no 3T target) -> 64mT input / output.
-        # This is the real deployment case and uses subjects never seen in training.
+        # Paired montage: the only view that shows whether the generated anatomy matches
+        # its ground truth, so always emit it (these slices are in-sample).
+        cond = val_inputs.to(acc.device, weight_dtype)
+        gen = sample_cond(cond, val_iavail.to(acc.device, weight_dtype),
+                          val_tavail.to(acc.device, weight_dtype), val_src)
+        inp = decode48(cond)
+        tgt = decode48(val_targets.to(acc.device, weight_dtype))
+        save_montage([[row(inp[i]), row(gen[i]), row(tgt[i])] for i in range(cond.shape[0])],
+                     "val_paired", step,
+                     f"step {step} — rows: 64mT input / generated 3T / real 3T; cols T1|T2|FLAIR")
+        # Unpaired ULF-only webb (no 3T target): the real deployment case, on subjects
+        # never seen in training.
         if val_uinputs is not None:
             uc = val_uinputs.to(acc.device, weight_dtype)
-            ug = sample_cond(uc, val_uiavail.to(acc.device, weight_dtype))
+            ug = sample_cond(uc, val_uiavail.to(acc.device, weight_dtype),
+                             src=["webb"] * uc.shape[0])   # the unpaired set is all webb
             ui = decode48(uc)
             save_montage([[row(ui[i]), row(ug[i])] for i in range(uc.shape[0])],
                          "val", step,
                          f"step {step} — unpaired webb; rows: 64mT input / generated 3T; cols T1|T2|FLAIR")
-        else:
-            # fallback (no val_input_root): sample from training pairs, incl. real 3T
-            cond = val_inputs.to(acc.device, weight_dtype)
-            gen = sample_cond(cond, val_iavail.to(acc.device, weight_dtype))
-            inp = decode48(cond)
-            tgt = decode48(val_targets.to(acc.device, weight_dtype))
-            save_montage([[row(inp[i]), row(gen[i]), row(tgt[i])] for i in range(cond.shape[0])],
-                         "val", step,
-                         f"step {step} — rows: 64mT input / generated 3T / real 3T; cols T1|T2|FLAIR")
+        if was_training:
+            net.train()
+
+    # ---- held-out metrics: the only signal that says whether more steps still help ----
+    # Noise and timesteps are drawn ONCE. Redrawing them each eval makes the metric a
+    # function of the draw as much as of the weights, and the trend disappears into it.
+    ho = None
+    if heldout is not None:
+        _g = torch.Generator().manual_seed(1234)
+        ho = {k: torch.stack([heldout[i][k] for i in range(len(heldout))])
+              for k in ("input", "target", "input_avail", "target_avail")}
+        ho["noise"] = torch.randn(ho["target"].shape, generator=_g)
+        ho["idx"] = torch.randint(0, noise_scheduler_copy.timesteps.numel(),
+                                  (len(heldout),), generator=_g)
+
+    @torch.no_grad()
+    def eval_heldout(step, do_image):
+        net = acc.unwrap_model(transformer)
+        was_training = net.training
+        net.eval()
+        iae = acc.unwrap_model(input_avail_embedder)
+        ae = acc.unwrap_model(avail_embedder) if avail_embedder is not None else None
+        n, bs = ho["target"].shape[0], max(1, args.train_batch_size)
+        num = den = 0.0
+        for s in range(0, n, bs):
+            sl = slice(s, min(s + bs, n))
+            lat = ho["target"][sl].to(acc.device, weight_dtype)
+            cnd = ho["input"][sl].to(acc.device, weight_dtype)
+            noise = ho["noise"][sl].to(acc.device, weight_dtype)
+            ts = noise_scheduler_copy.timesteps[ho["idx"][sl]].to(acc.device)
+            sig = get_sigmas(ts, lat.ndim, lat.dtype)
+            noisy = sig * noise + (1.0 - sig) * lat
+            b = lat.shape[0]
+            pooled = null_pooled.repeat(b, 1) + iae(ho["input_avail"][sl].to(acc.device, weight_dtype))
+            if ae is not None:
+                pooled = pooled + ae(ho["target_avail"][sl].to(acc.device, weight_dtype))
+            pred = net(hidden_states=torch.cat([noisy, cnd], 1), timestep=ts,
+                       encoder_hidden_states=null_prompt_embeds.repeat(b, 1, 1),
+                       pooled_projections=pooled, return_dict=False)[0]
+            if args.weighting_scheme == "sigma_sqrt":       # same velocity-space form as training
+                pred, ref = pred + lat, noise
+            else:
+                pred, ref = pred * (-sig) + noisy, lat
+            m = ho["target_avail"][sl].to(acc.device).float()
+            m = m.repeat_interleave(lat.shape[1] // args.n_modalities, dim=1)[:, :, None, None]
+            num += float((((pred.float() - ref.float()) ** 2) * m).sum())
+            den += float(m.sum()) * lat.shape[-1] * lat.shape[-2]
+        logs = {"val_loss": num / max(den, 1e-8)}
+
+        if do_image and val_vae is not None:
+            # central slices, not the first k: the held-out set is stored in volume order,
+            # so [:k] is the empty bottom of one subject and scores ~4dB below the truth.
+            k = min(args.eval_image_slices, n)
+            sel_idx = torch.tensor(central_picks(heldout.items, k))
+            gen = torch.from_numpy(sample_cond(
+                ho["input"][sel_idx].to(acc.device, weight_dtype),
+                ho["input_avail"][sel_idx].to(acc.device, weight_dtype),
+                ho["target_avail"][sel_idx].to(acc.device, weight_dtype),
+                [heldout.items[i]["dataset"] for i in sel_idx.tolist()])).to(acc.device)
+            real = torch.from_numpy(decode48(ho["target"][sel_idx].to(acc.device, weight_dtype))).to(acc.device)
+            av, ps, ss = ho["target_avail"][sel_idx], [], []
+            for c in range(args.n_modalities):
+                sel = av[:, c] > 0                          # skip modalities with no ground truth
+                if not bool(sel.any()):
+                    continue
+                x, y = gen[sel, c], real[sel, c]
+                mse = ((x - y) ** 2).flatten(1).mean(1)
+                ps += (10 * torch.log10(1.0 / mse.clamp_min(1e-12))).tolist()
+                ss += ssim(x, y).tolist()
+            logs["val_psnr"] = float(np.mean(ps))
+            logs["val_ssim"] = float(np.mean(ss))
+            logs["val_image_slices"] = k
+
+        if args.report_to == "wandb":
+            acc.log(logs, step=step)
+        print(f"[held-out] step {step}  " +
+              "  ".join(f"{k}={v:.4f}" for k, v in logs.items()), flush=True)
         if was_training:
             net.train()
 
@@ -602,6 +826,14 @@ def main():
 
     if acc.is_main_process:
         print(f"dataset slices={len(dataset)}  steps={args.max_train_steps}  use_avail={args.use_avail}")
+        if ds_weights:
+            n_by = {}
+            for it in dataset.items:
+                n_by[it["dataset"]] = n_by.get(it["dataset"], 0) + 1
+            tot = sum(n * ds_weights.get(d, 1.0) for d, n in n_by.items())
+            print("loss weights: " + "  ".join(
+                f"{d}={ds_weights.get(d, 1.0):g} ({n} slices -> {n * ds_weights.get(d, 1.0) / tot:.0%} of gradient)"
+                for d, n in sorted(n_by.items())), flush=True)
 
     global_step = resume_step
     done = False
@@ -654,8 +886,21 @@ def main():
                 sigmas = get_sigmas(timesteps, latents.ndim, latents.dtype)
                 noisy = sigmas * noise + (1.0 - sigmas) * latents
 
-                pe = null_prompt_embeds.repeat(bsz, 1, 1)                 # fixed "enhance" text
-                pooled = null_pooled.repeat(bsz, 1)
+                # --- text-side dropout: the second CFG axis. Independent of the image
+                #     dropout above, so the model sees all four combinations and both
+                #     v(x|text) and v(x|no text) are learned.
+                if text_bank is not None:
+                    rows = torch.tensor([text_row.get(d, null_row) for d in batch["dataset"]],
+                                        device=acc.device)
+                    if args.text_dropout_prob > 0:
+                        t_drop = torch.rand(bsz, device=acc.device) < args.text_dropout_prob
+                        rows = torch.where(t_drop, torch.full_like(rows, null_row), rows)
+                    # dropping the whole condition means dropping its text too
+                    if args.cond_dropout_prob > 0 and cfg_drop.any():
+                        rows = torch.where(cfg_drop, torch.full_like(rows, null_row), rows)
+                    pe, pooled = text_for(rows, bsz)
+                else:
+                    pe, pooled = text_for(None, bsz)                       # fixed "enhance" text
                 pooled = pooled + input_avail_embedder(in_avail.to(weight_dtype))
                 if avail_embedder is not None:
                     pooled = pooled + avail_embedder(batch["target_avail"].to(acc.device, dtype=weight_dtype))
@@ -689,15 +934,23 @@ def main():
                 else:                                        # logit_normal -> uniform weight
                     weighting = torch.ones_like(sigmas)
                 sq = weighting.float() * (model_pred.float() - target.float()) ** 2
+                # per-source loss weight -> scales that source's share of the gradient
+                w = None
+                if ds_weights:
+                    w = torch.tensor([ds_weights.get(d, 1.0) for d in batch["dataset"]],
+                                     device=acc.device).view(bsz, 1, 1, 1)
                 if args.mask_loss_by_avail and args.n_modalities > 1:
                     # target_avail [B,3] -> per-latent-channel mask [B,48,1,1]; a missing
                     # modality (KCL has no FLAIR) contributes no gradient, instead of being
                     # supervised against a copy-filled stand-in.
                     m = batch["target_avail"].to(acc.device).float()
                     m = m.repeat_interleave(ch_per_mod, dim=1)[:, :, None, None]
+                    if w is not None:
+                        m = m * w              # weight numerator and denominator alike
                     loss = (sq * m).sum() / (m.sum() * target.shape[-2] * target.shape[-1] + 1e-8)
                 else:
-                    loss = sq.reshape(bsz, -1).mean(1).mean()
+                    per = sq.reshape(bsz, -1).mean(1)
+                    loss = per.mean() if w is None else (per * w.flatten()).sum() / w.sum()
 
                 acc.backward(loss)
                 if acc.sync_gradients:
@@ -715,6 +968,9 @@ def main():
                 if (args.validation_steps and acc.is_main_process
                         and global_step % args.validation_steps == 0):
                     run_validation(global_step)
+                    if ho is not None:
+                        eval_heldout(global_step, bool(args.eval_psnr_steps)
+                                     and global_step % args.eval_psnr_steps == 0)
                 if global_step % args.checkpointing_steps == 0 and acc.is_main_process:
                     save_dir = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                     acc.unwrap_model(transformer).save_pretrained(os.path.join(save_dir, "transformer"))

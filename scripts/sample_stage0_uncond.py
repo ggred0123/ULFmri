@@ -1,18 +1,22 @@
 #!/usr/bin/env python
 """
-Sample from a Stage 0 unconditional 3T MRI checkpoint.
+Sample from a Stage 0 3T MRI prior checkpoint.
 
-Mirrors training/train_stage0_uncond.py exactly: stock SD3 MMDiT (16ch latent),
-fixed NULL text embeds, flow-matching Euler sampling, optional avail embedding
-added to the pooled projection. No CFG (there is no conditional branch to guide).
+Mirrors training/train_stage0_uncond.py: stock SD3 MMDiT, flow-matching Euler
+sampling, optional avail embedding added to the pooled projection.
+
+Text: pass --text_embeds_path (the orientation bank) + --prompt axial|coronal|
+sagittal to ask for a plane. Without them every sample uses the null prompt,
+which reproduces the older unconditional checkpoints.
 
 Outputs, per sample: a .npy of the raw [3,H,W] float image (T1w/T2w/FLAIR in
 [0,1]) plus a PNG grid of the three channels side by side.
 
 Run in a GPU container:
   python scripts/sample_stage0_uncond.py \
-    --checkpoint stage0_uncond_out/checkpoint-60000 \
-    --num_samples 8 --out_dir stage0_uncond_out/samples_60000
+    --checkpoint stage0_text_3ori_v1/checkpoint-60000 \
+    --text_embeds_path data_stage0_3ori_latents/orientation_embeds.pt \
+    --prompt coronal --num_samples 8
 """
 import argparse
 import os
@@ -39,7 +43,17 @@ def parse_args():
     p.add_argument("--checkpoint", required=True, help="path to a checkpoint-N dir (has transformer/)")
     p.add_argument("--pretrained_model_name_or_path", default="stabilityai/stable-diffusion-3-medium-diffusers",
                    help="source of the VAE + scheduler config")
-    p.add_argument("--null_embeds_path", default="/home/rintern14/ymk/data_stage0_3t_latents/null_embeds.pt")
+    p.add_argument("--null_embeds_path", default=None,
+                   help="fixed null embeds; not needed if --text_embeds_path is given "
+                        "(the bank carries its own '' row)")
+    p.add_argument("--text_embeds_path", default=None,
+                   help="prompt bank from data/precompute_text_embeds.py --scheme orientation")
+    p.add_argument("--prompt", default=None,
+                   help="row of the bank to sample, e.g. axial / coronal / sagittal. "
+                        "Default: the null ('') row.")
+    p.add_argument("--n_modalities", type=int, default=3,
+                   help="latents are n_modalities x 16ch, ordered [T1|T2|FLAIR]; must match "
+                        "the checkpoint. 1 = legacy packed-RGB 16ch latents.")
     p.add_argument("--out_dir", default=None, help="default: <checkpoint>/samples")
     p.add_argument("--num_samples", type=int, default=8)
     p.add_argument("--batch_size", type=int, default=4)
@@ -67,7 +81,15 @@ def main():
     vae = AutoencoderKL.from_pretrained(mp, subfolder="vae", torch_dtype=dtype).to(device).eval()
     scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(mp, subfolder="scheduler")
 
-    blob = torch.load(args.null_embeds_path, map_location="cpu")
+    if not (args.null_embeds_path or args.text_embeds_path):
+        raise SystemExit("need --text_embeds_path (prompt bank) or --null_embeds_path")
+    blob = torch.load(args.null_embeds_path or args.text_embeds_path, map_location="cpu")
+    if args.null_embeds_path is None:
+        row = args.prompt or "null"
+        if row not in blob:
+            raise SystemExit(f"--prompt {row!r} not in the bank; have {sorted(blob)}")
+        print(f"prompt: {row!r} -> {blob[row].get('prompt', '')!r}")
+        blob = blob[row]
     null_pe = blob["prompt_embeds"].to(device, dtype=dtype)
     null_pooled = blob["pooled_prompt_embeds"].to(device, dtype=dtype)
 
@@ -106,7 +128,17 @@ def main():
             )[0]
             latents = scheduler.step(model_pred, t, latents, return_dict=False)[0]
 
-        images = vae.decode(latents.to(dtype) / vae.config.scaling_factor, return_dict=False)[0]
+        latents = latents.to(dtype) / vae.config.scaling_factor
+        if args.n_modalities > 1:
+            # each modality owns its own 16ch block and was encoded as a separate
+            # grayscale image, so it has to be decoded on its own too (the trainer's
+            # validation does the same). Decoding all 48 channels at once is not valid.
+            ch = latents.shape[1] // args.n_modalities
+            images = torch.stack(
+                [vae.decode(latents[:, k * ch:(k + 1) * ch], return_dict=False)[0].mean(1)
+                 for k in range(args.n_modalities)], dim=1)                 # [B,3,H,W]
+        else:
+            images = vae.decode(latents, return_dict=False)[0]
         images = ((images.float() + 1.0) / 2.0).clamp(0, 1).cpu().numpy()   # [B,3,H,W] in [0,1]
 
         for i in range(bsz):
