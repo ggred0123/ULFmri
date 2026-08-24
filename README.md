@@ -105,6 +105,22 @@ bash scripts/run_stage0_final.sh
 $PREP data/preprocess_pairs.py
 $GPU  data/precompute_latents_pairs.py
 
+# Portable ZIP/raw-NIfTI workflow (ZIP extraction, CPU pair creation, and GPU
+# encoding can run on separate machines; see --help for bundle selection and layout):
+bash scripts/prepare_stage1_from_nifti.sh pairs \
+     --archive-root /data/new_nyu --work-root /data/ulfmri_work \
+     --prep-python /path/to/prep/bin/python
+
+# Or, when a normalized medical/{kcl,ulfenc,webb} tree already exists:
+bash scripts/prepare_stage1_from_nifti.sh pairs \
+     --medical-root /data/medical --work-root /data/ulfmri_work \
+     --prep-python /path/to/prep/bin/python
+bash scripts/prepare_stage1_from_nifti.sh latents \
+     --pairs-root /data/ulfmri_work/data_stage1_pairs_3ori \
+     --latents-root /data/ulfmri_work/data_stage1_latents_3ori \
+     --vae-path /path/to/sd3/vae --gpu-python /path/to/gpu/bin/python \
+     --batch-size 4
+
 # --- Stage 1 training + inference + eval ---
 bash scripts/run_stage1_cond.sh
 $GPU scripts/sample_stage1.py \

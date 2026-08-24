@@ -2,7 +2,7 @@
 Stage 1 preprocessing: build paired (64mT ULF input, 3T target) slices.
 
 For each subject that has both a 3T target (ses-c01, acq_HF) and a usable ULF
-input, produce axial slices of:
+input, produce paired slices of:
   input  = [T1, T2, FLAIR]  (64mT / ULF)   + input_avail
   target = [T1, T2, FLAIR]  (3T)           + target_avail
 
@@ -52,7 +52,11 @@ def find_targets(medical_root, ds):
     """subject -> {mod: 3T path} for ses-c01 acq_HF."""
     out = defaultdict(dict)
     for anat in sorted((medical_root / ds).glob("*/ses-c01/anat")):
-        for p in anat.glob("*HF*.nii.gz"):
+        # Accept both uncompressed .nii and .nii.gz.  A portable preprocessing
+        # environment should not depend on which NIfTI container was copied in.
+        for p in sorted(anat.iterdir()):
+            if not (p.name.endswith(".nii") or p.name.endswith(".nii.gz")):
+                continue
             m = HF_RE.match(p.name)
             if m:
                 out[m.group(1)][m.group(2)] = p
@@ -66,17 +70,19 @@ def find_inputs(medical_root, ds, sub, plane='axial'):
     T1-vs-T2 skull offset). The authors' pipeline produced coregistered versions in
     derivatives/<sub>/<ses>/processing/coregistration/{T1,T2,FLAIR}_axi.nii.gz
     (T1->T2, FLAIR->T2, then ->HF-T2 grid), so use those. Falls back to raw if absent.
-    kcl: TomoBrain ULF (already co-gridded with 3T). ulfenc: raw Axial (already aligned).
+    kcl: use the raw acquisition for the requested plane. ulfenc: raw Axial
+    (already aligned).
     """
     # The raw ses-00*/anat ULF is NOT registered to the 3T grid (it merely carries the
     # HF affine); the authors' pipeline wrote the registered versions under derivatives/
     # processing/coregistration. Use those.
     #   webb: {T1,T2,FLAIR}_axi.nii.gz   (Axial ULF -> HF-T2 space)
-    #   kcl : {T1,T2}_TomoBrain.nii.gz   (TomoBrain ULF -> HF-T2 space; no FLAIR)
-    if ds in ("webb", "kcl"):
-        suffix = {"webb": ("axi", [("T1w", "T1"), ("T2w", "T2"), ("FLAIR", "FLAIR")]),
-                  "kcl": ("TomoBrain", [("T1w", "T1"), ("T2w", "T2")])}[ds]
-        tag, mods = suffix
+    # Do NOT use KCL's derivative T1/T2_TomoBrain files here.  They are a single,
+    # known-bad reconstruction and would make axial/coronal/sagittal all resolve to
+    # the same input volume.  KCL must fall through to the plane-specific raw NIfTIs.
+    if ds == "webb":
+        tag = "axi"
+        mods = [("T1w", "T1"), ("T2w", "T2"), ("FLAIR", "FLAIR")]
         cor_dirs = sorted((medical_root / ds / "derivatives" / sub).glob("ses-*/processing/coregistration"))
         for cd in cor_dirs:                       # prefer the first session that has T1&T2
             got = {}
@@ -88,10 +94,11 @@ def find_inputs(medical_root, ds, sub, plane='axial'):
                 return got
         # fall through to raw if no usable coregistration dir
 
-    anat = list((medical_root / ds / sub).glob("ses-00*/anat"))
+    anat = sorted((medical_root / ds / sub).glob("ses-00*/anat"))
     if not anat:
         return {}
-    files = [p for a in anat for p in a.glob("*.nii.gz")]
+    files = sorted(p for a in anat for p in a.iterdir()
+                   if p.name.endswith(".nii") or p.name.endswith(".nii.gz"))
     # KCL: use the plane's own acquisition, NOT TomoBrain. The data authors flagged the
     # TomoBrain reconstructions as miscalculated, and KCL is the only site that acquired
     # ULF in all three planes anyway -- which is the whole point of the 3-plane rebuild.
@@ -220,8 +227,13 @@ def process_subject(ds, sub, tgt_paths, inp_paths, out_root, res, min_fg, meta_f
     if tgt is None:
         return 0, "target_build_fail"
 
+    # KCL plane-specific acquisitions are separate scans and always need rigid
+    # registration.  Webb's derivative inputs are already coregistered; if only raw
+    # Webb NIfTIs are present, register them as well even when their headers happen to
+    # carry the HF affine.
+    webb_raw = ds == "webb" and not all("derivatives" in p.parts for p in inp_paths.values())
     inp_avail, inp = build_side(inp_paths, tgt_paths, fixed, qc_i,
-                                force_register=(ds == "kcl"))
+                                force_register=(ds == "kcl" or webb_raw))
     if inp is None:
         return 0, "input_build_fail"
 
@@ -247,8 +259,11 @@ def process_subject(ds, sub, tgt_paths, inp_paths, out_root, res, min_fg, meta_f
             "orientation": plane,
             "input_avail": inp_avail, "target_avail": tgt_avail}) + "\n")
         kept += 1
-    qc_f.write(json.dumps({"dataset": ds, "subject": sub, "plane": plane, "input_avail": inp_avail,
-                           "target_avail": tgt_avail, "reg_target": qc_t, "reg_input": qc_i,
+    qc_f.write(json.dumps({"dataset": ds, "subject": sub, "plane": plane,
+                           "input_avail": inp_avail, "target_avail": tgt_avail,
+                           "input_paths": {m: str(p) for m, p in inp_paths.items()},
+                           "target_paths": {m: str(p) for m, p in tgt_paths.items()},
+                           "reg_target": qc_t, "reg_input": qc_i,
                            "slices": kept}) + "\n")
     return kept, "ok"
 
@@ -271,6 +286,18 @@ def main():
     excl = set(args.exclude) | {e.split("/")[-1] for e in args.exclude}
 
     medical_root, out_root = Path(args.medical_root), Path(args.out_root)
+    if not medical_root.is_dir():
+        ap.error(f"medical root does not exist or is not a directory: {medical_root}")
+
+    target_counts = {ds: len(find_targets(medical_root, ds)) for ds in args.datasets}
+    if not any(target_counts.values()):
+        ap.error(
+            "no 3T targets were found; expected "
+            "<medical_root>/<dataset>/<sub>/ses-c01/anat/"
+            "<sub>_ses-c01_acq-HF_{T1w,T2w[,FLAIR]}.nii[.gz]"
+        )
+    print("discovered target subjects: " +
+          "  ".join(f"{ds}={target_counts[ds]}" for ds in args.datasets), flush=True)
     out_root.mkdir(parents=True, exist_ok=True)
     meta_f = open(out_root / "metadata.jsonl", "w")
     qc_f = open(out_root / "pairs_qc.jsonl", "w")
